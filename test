@@ -1,0 +1,189 @@
+#! /usr/bin/env python3
+from geometry_msgs.msg import Twist
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSProfile
+from sensor_msgs.msg import LaserScan
+import math
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Pose
+from tf_transformations import euler_from_quaternion
+
+
+class ObstacleDetection(Node):
+    def __init__(self):
+        super().__init__("obstacle_detection")
+        
+        self.declare_parameter("stop_distance", 0.35)
+        self.stop_distance = self.get_parameter("stop_distance").get_parameter_value().double_value
+
+        self.pose = Pose()
+
+        self.odom_sub = self.create_subscription(
+            Odometry, "odom", self.get_odom_callback, qos_profile=qos_profile_sensor_data
+        )
+
+        self.scan_ranges = []
+        self.has_scan_received = False
+
+        # ===== NYTT ===== mål
+        self.goal_x = 1.5
+        self.goal_y = 0.0
+
+        # ===== NYTT ===== yaw
+        self.theta = 0.0
+
+        # ===== NYTT ===== scan-vinklar
+        self.scan_angle_min = 0.0
+        self.scan_angle_increment = 0.0
+        self.scan_angles = []
+
+        # ===== NYTT ===== hysteres
+        self.avoiding = False
+        self.avoid_direction = 0
+        self.avoid_target_heading = 0.0
+
+        # ===== NYTT ===== P-gain
+        self.k_ang = 1.8
+
+        self.tele_twist = Twist()
+        self.tele_twist.linear.x = 0.2
+        self.tele_twist.angular.z = 0.0
+
+        qos = QoSProfile(depth=10)
+
+        self.cmd_vel_pub = self.create_publisher(Twist, "cmd_vel", qos)
+
+        self.scan_sub = self.create_subscription(
+            LaserScan, "scan", self.scan_callback, qos_profile=qos_profile_sensor_data
+        )
+
+        self.cmd_vel_raw_sub = self.create_subscription(
+            Twist, "cmd_vel_raw", self.cmd_vel_raw_callback,
+            qos_profile=qos_profile_sensor_data
+        )
+
+        self.timer = self.create_timer(0.1, self.timer_callback)
+
+    def get_odom_callback(self, msg):
+        self.pose = msg.pose.pose
+        oriList = [self.pose.orientation.x, self.pose.orientation.y, self.pose.orientation.z, self.pose.orientation.w]
+        (_, _, yaw) = euler_from_quaternion(oriList)
+
+        # ===== NYTT ===== spara yaw
+        self.theta = yaw
+
+    def scan_callback(self, msg):
+        """Store laser scan data when received"""
+
+        # ===== NYTT ===== spara vinklar
+        self.scan_angle_min = msg.angle_min
+        self.scan_angle_increment = msg.angle_increment
+
+        # ===== NYTT ===== normalisera vinklar
+        self.scan_angles = []
+        for i in range(len(msg.ranges)):
+            angle = msg.angle_min + i * msg.angle_increment
+            angle = math.atan2(math.sin(angle), math.cos(angle))
+            self.scan_angles.append(angle)
+
+        self.scan_ranges = msg.ranges
+        self.has_scan_received = True
+
+    def cmd_vel_raw_callback(self, msg):
+        self.tele_twist = msg
+
+    def timer_callback(self):
+        if self.has_scan_received:
+            self.detect_obstacle()
+
+    # ===== NYTT ===== hjälpfunktion
+    def normalize_angle(self, a):
+        return math.atan2(math.sin(a), math.cos(a))
+
+    def detect_obstacle(self):
+        # ===== NYTT ===== filtrera + hitta närmaste hinder framåt
+        valid = []
+        for i, r in enumerate(self.scan_ranges):
+            if not math.isinf(r) and not math.isnan(r) and r > 0.01:
+                angle = self.scan_angles[i]
+
+                if -math.pi/2 <= angle <= math.pi/2:
+                    valid.append((i, r, angle))
+
+        if not valid:
+            self.cmd_vel_pub.publish(self.tele_twist)
+            return
+
+        _, obstacle_distance, obstacle_angle = min(valid, key=lambda x: x[1])
+
+        # ===== NYTT ===== go-to-goal
+        dx = self.goal_x - self.pose.position.x
+        dy = self.goal_y - self.pose.position.y
+        goal_heading = math.atan2(dy, dx)
+        e_goal = self.normalize_angle(goal_heading - self.theta)
+
+        twist = Twist()
+
+        # ===== NYTT ===== starta väjning
+        if not self.avoiding and obstacle_distance < self.stop_distance:
+            self.avoiding = True
+
+            if obstacle_angle > 0:
+                self.avoid_direction = -1
+            else:
+                self.avoid_direction = +1
+
+            self.avoid_target_heading = self.normalize_angle(
+                self.theta + self.avoid_direction * (math.pi / 2)
+            )
+
+        # ===== NYTT ===== väjning (hysteres)
+        if self.avoiding:
+            e_avoid = self.normalize_angle(self.avoid_target_heading - self.theta)
+
+            twist.angular.z = self.k_ang * e_avoid
+
+            if abs(e_avoid) > math.radians(45):
+                twist.linear.x = 0.0
+            else:
+                twist.linear.x = 0.05
+
+            if abs(e_avoid) < math.radians(8):
+                self.avoiding = False
+
+            self.cmd_vel_pub.publish(twist)
+            return
+
+        # ===== NYTT ===== go-to-goal styrning
+        twist.angular.z = self.k_ang * e_goal
+
+        if abs(e_goal) > math.radians(45):
+            twist.linear.x = 0.0
+        else:
+            twist.linear.x = 0.15
+
+        self.cmd_vel_pub.publish(twist)
+
+    def destroy_node(self):
+        self.get_logger().info("Shutting down, stopping robot...")
+        stop_twist = Twist()
+        self.cmd_vel_pub.publish(stop_twist)
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    obstacle_detection = ObstacleDetection()
+    try:
+        rclpy.spin(obstacle_detection)
+    except KeyboardInterrupt:
+        obstacle_detection.get_logger().info('KeyboardInterrupt caught.')
+    finally:
+        obstacle_detection.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
